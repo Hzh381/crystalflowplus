@@ -84,6 +84,20 @@ def get_model_path(eval_model_name):
     return model_path
 
 
+def get_scaler(model, cfg, key):
+    """从 dict 或 list 类型的 scaler 存储中取出指定物性的 scaler。"""
+    scalers = getattr(model, "scalers", None)
+    if scalers is None:
+        raise AttributeError("Model has no property scalers loaded.")
+    if isinstance(scalers, dict):
+        if key not in scalers:
+            raise KeyError(f"No scaler stored for property '{key}'. Available: {list(scalers)}")
+        return scalers[key]
+    if key not in cfg.data.properties:
+        raise KeyError(f"Property '{key}' is not listed in data.properties.")
+    return scalers[cfg.data.properties.index(key)]
+
+
 def load_config(model_path):
     with initialize_config_dir(str(model_path), version_base="1.3"):
         cfg = hydra.compose(config_name='hparams')

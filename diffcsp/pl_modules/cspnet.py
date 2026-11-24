@@ -236,6 +236,8 @@ class CSPNet(nn.Module):
         smooth=False,
         pred_type=False,
         pred_scalar=False,
+        pred_prop=False,
+        prop_hidden_dim=None,
         type_encoding: None | nn.Module = None,
     ):
         super(CSPNet, self).__init__()
@@ -321,6 +323,17 @@ class CSPNet(nn.Module):
         self.pred_scalar = pred_scalar
         if self.pred_scalar:
             self.scalar_out = nn.Linear(hidden_dim, 1)
+        self.pred_prop = pred_prop
+        if self.pred_scalar and self.pred_prop:
+            raise ValueError("pred_scalar and pred_prop are mutually exclusive.")
+        # 物性预测头：对图级特征做两层 MLP，输出一个标量物性（如形成能）。
+        if self.pred_prop:
+            _prop_hidden = prop_hidden_dim if prop_hidden_dim is not None else hidden_dim
+            self.prop_out = nn.Sequential(
+                nn.Linear(hidden_dim, _prop_hidden),
+                self.act_fn,
+                nn.Linear(_prop_hidden, 1),
+            )
 
     def select_symmetric_edges(self, tensor, mask, reorder_idx, inverse_neg):
         # Mask out counter-edges
@@ -517,12 +530,19 @@ class CSPNet(nn.Module):
         if self.pred_scalar:
             return self.scalar_out(graph_features)
 
+        # 图级物性预测（附加输出，放在流场输出之后）
+        prop_out = self.prop_out(graph_features) if self.pred_prop else None
+
         lattice_out = self.lattice_out(graph_features)
         lattice_out = lattice_out.view(lattices_rep.shape)
         if self.ip:
             lattice_out = torch.einsum('bij,bjk->bik', lattice_out, lattices_rep)
         if self.pred_type:
             type_out = self.type_out(node_features)
+            if self.pred_prop:
+                return lattice_out, coord_out, type_out, prop_out
             return lattice_out, coord_out, type_out
+        if self.pred_prop:
+            return lattice_out, coord_out, prop_out
 
         return lattice_out, coord_out

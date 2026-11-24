@@ -88,6 +88,8 @@ def main(args):
         step_lr=step_lr, N=args.ode_int_steps,
         anneal_lattice=args.anneal_lattice, anneal_coords=args.anneal_coords, anneal_type=args.anneal_type, anneal_slope=args.anneal_slope, anneal_offset=args.anneal_offset,
         guide_factor=args.guide_factor,
+        guide_s_min=args.guide_s_min, guide_s_max=args.guide_s_max,
+        guide_gamma=args.guide_gamma, guide_time_dir=args.guide_time_dir,
     )
 
     if args.label == '':
@@ -128,6 +130,10 @@ if __name__ == '__main__':
 
     guidance_group = parser.add_argument_group('guidance')
     guidance_group.add_argument('--guide-factor', type=float, help='guidance factor (default: None)')
+    guidance_group.add_argument('--guide-s-min', type=float, default=None, help='minimum strength of a time-adaptive guidance schedule')
+    guidance_group.add_argument('--guide-s-max', type=float, default=None, help='maximum strength of a time-adaptive guidance schedule')
+    guidance_group.add_argument('--guide-gamma', type=float, default=1.0, help='exponent of the time-adaptive guidance schedule')
+    guidance_group.add_argument('--guide-time-dir', choices=['ascending', 'descending'], default='ascending', help='time direction of the guidance schedule (t=0 noise, t=1 data)')
 
     args = parser.parse_args()
     main(args)

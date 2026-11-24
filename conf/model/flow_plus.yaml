@@ -1,0 +1,64 @@
+# CrystalFlow+：条件引导（CFG，B）+ GradNorm（C）+ 物性预测头（D）。
+#
+# 训练示例：
+#   python diffcsp/run.py data=mp_20_ehull model=flow_plus expname=flow-plus
+#   python diffcsp/run.py data=alex_20_eform model=flow_plus expname=flow-plus-eform
+#
+# 采样示例（时间自适应引导：t=0 噪声端较弱，t=1 数据端较强）：
+#   python scripts/generation.py -m <model_path> -N 100 \
+#       --guide-factor 1.0 --guide-s-min 0.5 --guide-s-max 2.5 --guide-gamma 1.0 \
+#       --conditions "e_above_hull=0.0"
+#
+# 若需同时生成原子类型，追加：model.decoder.pred_type=true
+
+_target_: diffcsp.pl_modules.flow.CSPFlow
+time_dim: 256
+latent_dim: 0
+cost_type: 1.
+cost_coord: 1.
+cost_lattice: 1.
+max_neighbors: 20  # decoder 在线建图时的最大邻居数
+radius: 7.  # decoder 在线建图时的最大搜索半径
+timesteps: 1000
+
+# --- B：Classifier-Free Guidance（条件引导）--------------------------------
+# 训练时丢弃条件的概率，使同一个网络同时学习 v(x|y) 与 v(x)。
+# 推理时：v_cfg = v_uncond + s(t) * (v_cond - v_uncond)
+cond_drop_prob: 0.15
+
+# --- D：物性预测头 ----------------------------------------------------------
+# 在真实（t=1）结构上、且不输入条件向量地进行预测，避免筛选时把目标物性
+# 直接泄漏给预测结果。
+property_head:
+  enabled: true
+  key: null            # null 表示取 data.conditions[0]，否则回退到 data.prop
+  cost: 0.2
+  supervision: clean   # clean（真实结构）| time_gated（按时间门控的噪声态）
+  t_min: 0.5           # 仅 time_gated：忽略 t < t_min 的样本
+  power: 1.0           # 仅 time_gated：门控权重为 t**power
+  clean_freq: 1        # 每 N 个训练步执行一次额外的干净结构前向
+  hidden_dim: 128
+
+# --- C：GradNorm 多任务动态损失平衡 -----------------------------------------
+gradnorm:
+  enabled: true
+  tasks: [lattice, coord]
+  alpha: 0.12
+  lr: 0.025
+  warmup_steps: 200
+  update_freq: 1
+  shared_module: decoder.csp_layer_5   # 共享 GNN 的最后一层
+  min_weight: 0.001
+  max_weight: 1000.0
+
+
+defaults:
+  - decoder: cspnet
+  - beta_scheduler: cosine
+  - sigma_scheduler: wrapped
+  - conditions: default
+  - _self_
+
+decoder:
+  pred_type: false
+  smooth: ${model.decoder.pred_type}

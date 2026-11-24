@@ -7,6 +7,7 @@
 import copy
 import math
 import random
+import re
 import logging
 from typing import Any, Dict
 from functools import partial, partialmethod, wraps
@@ -45,6 +46,7 @@ from diffcsp.pl_modules.lattice_utils import LatticeDecompNN
 # from diffcsp.pl_modules.ode_solvers import str_to_solver
 from diffcsp.pl_modules.symmetrize import SymmetrizeRotavg
 from diffcsp.pl_modules.conditioning import MultiEmbedding
+from diffcsp.pl_modules.gradnorm import GradNorm
 from diffcsp.pl_modules.time_scheduler import TimeScheduler
 from diffcsp.pl_modules.type_module import TypeTableModule
 
@@ -106,8 +108,19 @@ class CSPFlow(BaseModule):
             self.time_embedding = SinusoidalTimeEmbeddings(self.time_dim)
         self.time_scheduler = TimeScheduler(self.hparams.get("time_scheduler", ""))
 
-        self.guide_threshold = self.hparams.get("guide_threshold", None)
+        # Classifier-Free Guidance（CFG）：cond_drop_prob 是训练时丢弃条件、
+        # 学习无条件流场的概率；guide_threshold 作为旧配置名的兼容别名。
+        self.guide_threshold = self.hparams.get(
+            "cond_drop_prob", self.hparams.get("guide_threshold", None)
+        )
         if self.guide_threshold is not None:
+            cond_cfg = self.hparams.get("conditions", None)
+            cond_keys = list(cond_cfg.get("cond_keys", [])) if cond_cfg is not None else []
+            if len(cond_keys) == 0:
+                raise ValueError(
+                    "Classifier-free guidance requires at least one condition; "
+                    "please set `data.conditions` or unset `cond_drop_prob`."
+                )
             self.cond_emb = MultiEmbedding(**self.hparams.conditions)
             cemb_dim = self.cond_emb.n_out
         else:
@@ -117,13 +130,81 @@ class CSPFlow(BaseModule):
         self.type_encoding = self.hparams.get('type_encoding', None)
         if self.type_encoding == "table":
             self.type_encoding = TypeTableModule()
+
+        # 辅助物性预测头（研究路线 D）。
+        prop_cfg = self.hparams.get("property_head", None)
+        self.prop_cfg = prop_cfg
+        self.prop_enabled = bool(prop_cfg is not None and prop_cfg.get("enabled", False))
+        self.prop_key = None
+        self.prop_supervision = "clean"
+        self.prop_cost = 1.0
+        self.prop_t_min = 0.0
+        self.prop_power = 1.0
+        self.prop_clean_freq = 1
+        self.prop_hidden_dim = None
+        if self.prop_enabled:
+            data_cfg = self.hparams.get("data", None)
+            data_props = list(data_cfg.get("properties", None) or []) if data_cfg is not None else []
+            data_prop = data_cfg.get("prop", None) if data_cfg is not None else None
+            self.prop_key = prop_cfg.get("key", None)
+            if self.prop_key is None:
+                conditions = data_cfg.get("conditions", None) if data_cfg is not None else None
+                if conditions:
+                    self.prop_key = conditions[0]
+                else:
+                    self.prop_key = data_prop or "y"
+            if data_cfg is not None and self.prop_key not in data_props and self.prop_key != data_prop:
+                raise ValueError(
+                    f"property_head.key='{self.prop_key}' is not available in the dataset. "
+                    f"Add it to `data.properties` (available: {data_props + ([data_prop] if data_prop else [])})."
+                )
+            self.prop_supervision = prop_cfg.get("supervision", "clean")
+            if self.prop_supervision not in ("clean", "time_gated"):
+                raise ValueError(
+                    f"Unknown property supervision '{self.prop_supervision}', expected 'clean' or 'time_gated'."
+                )
+            self.prop_cost = float(prop_cfg.get("cost", 0.2))
+            self.prop_t_min = float(prop_cfg.get("t_min", 0.5))
+            if not 0.0 <= self.prop_t_min < 1.0:
+                raise ValueError("property_head.t_min must be in [0, 1).")
+            self.prop_power = float(prop_cfg.get("power", 1.0))
+            self.prop_clean_freq = max(1, int(prop_cfg.get("clean_freq", 1)))
+            self.prop_hidden_dim = prop_cfg.get("hidden_dim", None)
+
+        # GradNorm 多任务动态损失平衡（研究路线 C）。
+        gn_cfg = self.hparams.get("gradnorm", None)
+        self.gradnorm_cfg = gn_cfg
+        self.gradnorm = None
+        if gn_cfg is not None and gn_cfg.get("enabled", False):
+            tasks = list(gn_cfg.get("tasks", ["lattice", "coord"]))
+            if self.prop_enabled and "property" not in tasks:
+                tasks.append("property")
+            init_weights = gn_cfg.get("init_weights", None)
+            self.gradnorm = GradNorm(
+                task_names=tasks,
+                alpha=float(gn_cfg.get("alpha", 0.12)),
+                lr=float(gn_cfg.get("lr", 0.025)),
+                init_weights=dict(init_weights) if init_weights is not None else None,
+                warmup_steps=int(gn_cfg.get("warmup_steps", 0)),
+                update_freq=int(gn_cfg.get("update_freq", 1)),
+                min_weight=float(gn_cfg.get("min_weight", 1e-3)),
+                max_weight=float(gn_cfg.get("max_weight", 1e3)),
+            )
+        self._gn_shared_params = None
+
         self.decoder = hydra.utils.instantiate(
             self.hparams.decoder,
             type_encoding=self.type_encoding,
             latent_dim=self.hparams.latent_dim + self.time_dim,  # 0 + time
             cemb_dim=cemb_dim,
+            pred_prop=self.prop_enabled,
+            prop_hidden_dim=self.prop_hidden_dim,
             _recursive_=False,
         )
+        if self.prop_enabled and not getattr(self.decoder, "pred_prop", False):
+            raise ValueError(
+                "property_head is only supported by decoders that implement `pred_prop` (e.g. cspnet)."
+            )
         self.beta_scheduler = hydra.utils.instantiate(self.hparams.beta_scheduler)
         self.sigma_scheduler = hydra.utils.instantiate(self.hparams.sigma_scheduler)
         self.keep_lattice = self.hparams.cost_lattice < 1e-5
@@ -162,6 +243,17 @@ class CSPFlow(BaseModule):
             hydra.utils.log.warning(f"cost_lattice={self.hparams.cost_lattice}, setting to keep lattice.")
         if self.keep_coords:
             hydra.utils.log.warning(f"cost_coords={self.hparams.cost_coord}, setting to keep coords.")
+        if self.guide_threshold is not None:
+            hydra.utils.log.info(
+                f"Classifier-free guidance enabled (cond_drop_prob={self.guide_threshold})."
+            )
+        if self.prop_enabled:
+            hydra.utils.log.info(
+                f"Property head enabled: key={self.prop_key}, cost={self.prop_cost}, "
+                f"supervision={self.prop_supervision}."
+            )
+        if self.gradnorm is not None:
+            hydra.utils.log.info(f"GradNorm enabled: {self.gradnorm}")
 
     def sample_lengths(self, num_atoms, batch_size):
         loc = math.log(2)
@@ -186,6 +278,79 @@ class CSPFlow(BaseModule):
         if self.from_cubic:
             l0[:, :5] = 0
         return l0
+
+    def _property_target(self, batch, ref):
+        """取出 batch 中已归一化的目标物性；缺失时回退到 batch.y。"""
+        if self.prop_key == "y":
+            target = batch.y
+        else:
+            target = batch.get(self.prop_key)
+            if target is None:
+                target = batch.y
+        return target.view_as(ref)
+
+    def _property_loss(self, pred_prop, batch, times):
+        target = self._property_target(batch, pred_prop)
+        per_graph = F.mse_loss(pred_prop, target, reduction="none").mean(dim=-1)
+        if self.prop_supervision == "time_gated":
+            # 只对接近真实结构的时间步（t >= t_min）做监督，并按 t^power 加权，
+            # 避免把任意噪声中间态当作真实物性目标。
+            if self.prop_t_min > 0.0:
+                gate = ((times - self.prop_t_min) / (1.0 - self.prop_t_min)).clamp(0.0, 1.0)
+            else:
+                gate = torch.ones_like(times)
+            gate = gate.pow(self.prop_power)
+            return (per_graph * gate).sum() / gate.sum().clamp_min(1.0)
+        return per_graph.mean()
+
+    def _clean_property_prediction(self, batch, frac_coords, lattices_rep, lattices_mat):
+        """在真实（t=1）结构上做物性预测。
+
+        预测头不应看到噪声中间态，也不应看到条件向量，否则会学成“复述
+        目标物性”而不是根据结构进行估计。
+        """
+        times = self.time_scheduler(torch.ones(batch.num_graphs, device=self.device))
+        time_emb = self.time_embedding(times)
+        if self.pred_type:
+            if getattr(self.decoder, "smooth", True):
+                if self.type_encoding is None:
+                    atom_types = F.one_hot(batch.atom_types - 1, num_classes=MAX_ATOMIC_NUM).float()
+                else:
+                    atom_types = self.type_encoding(batch.atom_types)
+            else:
+                atom_types = batch.atom_types
+        else:
+            atom_types = batch.atom_types
+        outs = self.decoder(
+            t=time_emb,
+            atom_types=atom_types,
+            frac_coords=frac_coords,
+            lattices_rep=lattices_rep,
+            num_atoms=batch.num_atoms,
+            node2graph=batch.batch,
+            lattices_mat=lattices_mat,
+            cemb=None,
+            guide_indicator=None,
+        )
+        return outs[-1]
+
+    @torch.no_grad()
+    def predict_property(self, batch):
+        """对 batch 中的真实晶体结构预测（已归一化的）辅助物性。"""
+        if not self.prop_enabled:
+            raise RuntimeError("This model has no property head (property_head.enabled=False).")
+        lattices = lattice_params_to_matrix_torch(batch.lengths, batch.angles)
+        if self.lattice_polar:
+            lattices_rep = lattice_polar_decompose_torch(lattices)
+            if self.symmetrize_anchor or self.symmetrize_rotavg:
+                lattices_rep = self.latticedecompnn.proj_k_to_spacegroup(lattices_rep, batch.spacegroup)
+            lattices_mat = lattice_polar_build_torch(lattices_rep)
+        else:
+            lattices_rep = lattices
+            lattices_mat = lattices
+        return self._clean_property_prediction(
+            batch, batch.frac_coords, lattices_rep, lattices_mat
+        )
 
     def forward(self, batch, guide_threshold=None):
 
@@ -300,10 +465,13 @@ class CSPFlow(BaseModule):
             lattices_mat=input_lattice_mat,
             cemb=cemb, guide_indicator=guide_indicator,
         )
+        pred_l, pred_f = pred[0], pred[1]
+        out_idx = 2
         if self.pred_type:
-            pred_l, pred_f, pred_t = pred
-        else:
-            pred_l, pred_f = pred
+            pred_t = pred[out_idx]
+            out_idx += 1
+        if self.prop_enabled:
+            pred_prop = pred[out_idx]
 
         loss_sym_l = 0.0
         loss_sym_f = 0.0
@@ -347,25 +515,80 @@ class CSPFlow(BaseModule):
         else:
             loss_type = 0.0
 
+        loss_prop = 0.0
+        if self.prop_enabled:
+            # clean：在真实结构上额外前向一次；time_gated：复用当前噪声态并按时间门控。
+            if self.prop_supervision == "clean":
+                run_clean = (not self.training) or (self.global_step % self.prop_clean_freq == 0)
+                if run_clean:
+                    pred_prop_clean = self._clean_property_prediction(
+                        batch, frac_coords, lattices_rep_T, lattices_mat_T
+                    )
+                    loss_prop = self._property_loss(
+                        pred_prop_clean, batch, torch.ones(batch_size, device=self.device)
+                    )
+            else:
+                loss_prop = self._property_loss(pred_prop, batch, times)
+
         cost_coord = self.hparams.cost_coord
         cost_lattice = 0.0 if lattice_teacher_forcing else self.hparams.cost_lattice
         cost_type    = 0.0 if not self.pred_type      else self.hparams.cost_type
-        loss = (
-              cost_lattice * loss_lattice
-            + cost_coord   * loss_coord
-            + cost_type    * loss_type
-            + self.cost_sym_lattice * loss_sym_l
-            + self.cost_sym_coord   * loss_sym_f
-        )
+        loss_terms = {}
+        if cost_lattice > 0.0 or self.cost_sym_lattice > 0.0:
+            loss_terms['lattice'] = cost_lattice * loss_lattice + self.cost_sym_lattice * loss_sym_l
+        if cost_coord > 0.0 or self.cost_sym_coord > 0.0:
+            loss_terms['coord'] = cost_coord * loss_coord + self.cost_sym_coord * loss_sym_f
+        if self.pred_type and cost_type > 0.0:
+            loss_terms['type'] = cost_type * loss_type
+        if self.prop_enabled:
+            loss_terms['property'] = self.prop_cost * loss_prop
+        if not loss_terms:
+            raise RuntimeError("All flow-matching loss weights are zero.")
+        loss = sum(loss_terms.values())
 
         return {
             'loss': loss,
+            'loss_terms': loss_terms,
             'loss_lattice': loss_lattice,
             'loss_coord': loss_coord,
             'loss_type': loss_type,
+            'loss_property': loss_prop,
             'loss_sym_lattice': loss_sym_l,
             'loss_sym_coord': loss_sym_f,
         }
+
+    def _get_gradnorm_params(self):
+        """GradNorm 测量梯度范数所用的共享参数。"""
+        if self._gn_shared_params is not None:
+            return self._gn_shared_params
+        params = None
+        path = None
+        if self.gradnorm_cfg is not None:
+            path = self.gradnorm_cfg.get("shared_module", None)
+        if path:
+            module = self
+            for part in path.split("."):
+                module = getattr(module, part, None)
+                if module is None:
+                    break
+            if module is not None:
+                params = [p for p in module.parameters() if p.requires_grad]
+        if not params:
+            names = dict(self.named_parameters())
+            matched = [n for n in names if n.startswith("decoder.csp_layer_")]
+            if matched:
+                def _layer_idx(name):
+                    m = re.search(r"csp_layer_(\d+)", name)
+                    return int(m.group(1)) if m else -1
+
+                last = max(_layer_idx(n) for n in matched)
+                params = [p for n, p in names.items() if _layer_idx(n) == last]
+            else:
+                params = [p for p in self.decoder.parameters() if p.requires_grad]
+        if not params:
+            raise RuntimeError("GradNorm could not resolve any shared parameters.")
+        self._gn_shared_params = params
+        return params
 
     @staticmethod
     def get_anneal_factor(t, slope: float = 0.0, offset: float = 0.0):
@@ -379,10 +602,9 @@ class CSPFlow(BaseModule):
         anneal_lattice=False, anneal_coords=False, anneal_type=False,
         anneal_slope=0.0, anneal_offset=0.0,
     ):
+        pred_l, pred_f = pred[0], pred[1]
         if self.pred_type:
-            pred_l, pred_f, pred_t = pred
-        else:
-            pred_l, pred_f = pred
+            pred_t = pred[2]
         if self.symmetrize_anchor:
             if self.lattice_polar:
                 pred_l = self.latticedecompnn.proj_kdiff_to_spacegroup(pred_l, batch.spacegroup)
@@ -421,9 +643,21 @@ class CSPFlow(BaseModule):
         anneal_lattice=False, anneal_coords=False, anneal_type=False,
         anneal_slope=0.0, anneal_offset=0.0,
         guide_factor=None,
+        guide_s_min=None, guide_s_max=None,
+        guide_gamma=1.0, guide_time_dir="ascending",
         **kwargs,
     ):
         """
+        Classifier-Free Guidance 采样::
+
+            v_cfg(t) = v_uncond + s(t) * (v_cond - v_uncond)
+
+        未指定时间调度时，``guide_factor`` 即为常数引导强度。给定
+        ``guide_s_min`` / ``guide_s_max`` 时，强度服从
+        ``s(t) = s_min + (s_max - s_min) * u**guide_gamma``，其中
+        ``guide_time_dir="ascending"`` 时 ``u = t``，``"descending"`` 时
+        ``u = 1 - t``（t=0 为噪声端，t=1 为数据端）。
+
         Requires
             non-symmetry: num_nodes atom_types
             symmetry: num_nodes atom_types spacegroup anchor_index ops ops_inv (general_ops symm_map num_general_ops)
@@ -433,14 +667,26 @@ class CSPFlow(BaseModule):
 
         batch_size = batch.num_graphs
 
-        if self.guide_threshold is None and guide_factor is not None:
+        if guide_time_dir not in ("ascending", "descending"):
+            raise ValueError(
+                f"guide_time_dir must be 'ascending' or 'descending', got {guide_time_dir!r}."
+            )
+        use_guidance = self.guide_threshold is not None
+        if not use_guidance and guide_factor is not None:
             raise ValueError("Model is not trained with guidance but trying to sample with guidance.")
-        if self.guide_threshold is not None and guide_factor is None:
-            raise ValueError("Model is trained with guidance but trying to sample with no guidance.")
-
-        if guide_factor is not None:
+        if use_guidance and guide_factor is None:
+            if guide_s_min is None and guide_s_max is None:
+                raise ValueError("Model is trained with guidance but trying to sample with no guidance.")
+            guide_factor = 1.0
+        if use_guidance:
             if self.cond_emb is None:
                 raise Exception("Model is not trained with guidance")
+            missing = [key for key in self.cond_emb.cond_keys if batch.get(key) is None]
+            if missing:
+                raise ValueError(
+                    f"Guided sampling requires the conditions {missing}; "
+                    "pass them through the sampling batch (e.g. --conditions)."
+                )
             cemb = self.cond_emb(**{key: batch.get(key) for key in self.cond_emb.cond_keys})
             guide_indicator = torch.ones(batch_size, device=self.device)
 
@@ -526,11 +772,48 @@ class CSPFlow(BaseModule):
                 lattices_mat_t = lattices_mat_T
 
             # ========= pred each step start =========
-            if (guide_factor is not None) and (abs(guide_factor - 1) < 1e-4):  # no need to compute
-                pred_l = 0.0
-                pred_f = 0.0
-                if self.pred_type:
-                    pred_t = 0.0
+            if use_guidance:
+                # 计算当前时间步的引导强度 s(t)。
+                strength = guide_factor
+                if guide_s_min is not None or guide_s_max is not None:
+                    s_min = guide_factor if guide_s_min is None else guide_s_min
+                    s_max = guide_factor if guide_s_max is None else guide_s_max
+                    u = t_stamp if guide_time_dir == "ascending" else 1.0 - t_stamp
+                    strength = s_min + (s_max - s_min) * (u ** guide_gamma)
+
+                def _decode(use_cond):
+                    pred = self.decoder(
+                        t=time_emb,
+                        atom_types=t_t,
+                        frac_coords=f_t,
+                        lattices_rep=l_t,
+                        num_atoms=batch.num_atoms,
+                        node2graph=batch.batch,
+                        lattices_mat=lattices_mat_t,
+                        cemb=cemb if use_cond else None,
+                        guide_indicator=guide_indicator if use_cond else None,
+                    )
+                    return self.post_decoder_on_sample(
+                        pred,
+                        batch=batch, t=t_stamp,
+                        anneal_lattice=anneal_lattice, anneal_coords=anneal_coords,
+                        anneal_type=anneal_type,
+                        anneal_slope=anneal_slope, anneal_offset=anneal_offset,
+                    )
+
+                if abs(strength - 1.0) < 1e-4:
+                    # s≈1 时结果等于条件预测，跳过无条件分支以省算力。
+                    pred = _decode(True)
+                elif abs(strength) < 1e-4:
+                    # s≈0 时结果等于无条件预测，跳过条件分支。
+                    pred = _decode(False)
+                else:
+                    pred_cond = _decode(True)
+                    pred_uncond = _decode(False)
+                    pred = tuple(
+                        u_v + strength * (c_v - u_v)
+                        for u_v, c_v in zip(pred_uncond, pred_cond)
+                    )
             else:
                 pred = self.decoder(
                     t=time_emb,
@@ -548,35 +831,9 @@ class CSPFlow(BaseModule):
                     anneal_lattice=anneal_lattice, anneal_coords=anneal_coords, anneal_type=anneal_type,
                     anneal_slope=anneal_slope, anneal_offset=anneal_offset,
                 )
-                if self.pred_type:
-                    pred_l, pred_f, pred_t = pred
-                else:
-                    pred_l, pred_f = pred
-
-            if guide_factor is not None:
-                pred = self.decoder(
-                    t=time_emb,
-                    atom_types=t_t,
-                    frac_coords=f_t,
-                    lattices_rep=l_t,
-                    num_atoms=batch.num_atoms,
-                    node2graph=batch.batch,
-                    lattices_mat=lattices_mat_t,
-                    cemb=cemb, guide_indicator=guide_indicator,
-                )
-                pred = self.post_decoder_on_sample(
-                    pred,
-                    batch=batch, t=t_stamp,
-                    anneal_lattice=anneal_lattice, anneal_coords=anneal_coords,
-                    anneal_slope=anneal_slope, anneal_offset=anneal_offset,
-                )
-                if self.pred_type:
-                    pred_l_guide, pred_f_guide, pred_t_guide = pred
-                    pred_t = guide_factor * pred_t_guide + (1 - guide_factor) * pred_t
-                else:
-                    pred_l_guide, pred_f_guide = pred
-                pred_l = guide_factor * pred_l_guide + (1 - guide_factor) * pred_l
-                pred_f = guide_factor * pred_f_guide + (1 - guide_factor) * pred_f
+            pred_l, pred_f = pred[0], pred[1]
+            if self.pred_type:
+                pred_t = pred[2]
             # ========= pred each step end =========
 
             # ========= update each step start =========
@@ -625,11 +882,11 @@ class CSPFlow(BaseModule):
     def single_time_decoder(self, t, **kwargs):
         batch_size = kwargs["num_atoms"].shape[0]
         time_emb = self.time_embedding(t.repeat(batch_size))
-        pred_l, pred_x = self.decoder(
+        pred = self.decoder(
             t=time_emb,
             **kwargs,
         )
-        return pred_l, pred_x
+        return pred[0], pred[1]
 
     def _resign_lattice_decoder(self, t, x, **kwargs):
         return self.single_time_decoder(t=t, lattices_rep=x, **kwargs)
@@ -807,16 +1064,31 @@ class CSPFlow(BaseModule):
         output_dict = self(batch)
 
         loss = output_dict['loss']
+        log_dict = {
+            'train_loss': loss,
+            'lattice_loss': output_dict['loss_lattice'],
+            'coord_loss': output_dict['loss_coord'],
+            'type_loss': output_dict['loss_type'],
+            'sym_lattice_loss': output_dict['loss_sym_lattice'],
+            'sym_coord_loss': output_dict['loss_sym_coord'],
+        }
+        if self.prop_enabled:
+            log_dict['prop_loss'] = output_dict['loss_property']
+
+        if self.gradnorm is not None:
+            # 用 GradNorm 动态权重组合各任务损失，并在反向传播前更新权重。
+            task_losses = output_dict['loss_terms']
+            loss = self.gradnorm.combine(task_losses)
+            weights = self.gradnorm.update(
+                task_losses, self._get_gradnorm_params(), int(self.global_step)
+            )
+            log_dict['train_loss'] = loss
+            log_dict['train_loss_base'] = output_dict['loss']
+            if weights is not None:
+                log_dict.update({f'gn_w_{name}': w for name, w in weights.items()})
 
         self.log_dict(
-            {
-                'train_loss': loss,
-                'lattice_loss': output_dict['loss_lattice'],
-                'coord_loss': output_dict['loss_coord'],
-                'type_loss': output_dict['loss_type'],
-                'sym_lattice_loss': output_dict['loss_sym_lattice'],
-                'sym_coord_loss': output_dict['loss_sym_coord'],
-            },
+            log_dict,
             on_step=True,
             on_epoch=True,
             prog_bar=True,
@@ -865,6 +1137,8 @@ class CSPFlow(BaseModule):
             f'{prefix}_sym_lattice_loss': output_dict['loss_sym_lattice'],
             f'{prefix}_sym_coord_loss': output_dict['loss_sym_coord'],
         }
+        if self.prop_enabled:
+            log_dict[f'{prefix}_prop_loss'] = output_dict['loss_property']
 
         return log_dict, loss
 
